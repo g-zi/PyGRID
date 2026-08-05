@@ -1,70 +1,81 @@
 from dataclasses import dataclass
-import numpy as np
+from pathlib import Path
 
 
 @dataclass
-class SurfacePoint:
+class MapPoint:
     x: float
     y: float
     z: float
-    identifier: str
+    id: str
 
 
+class ContourMap:
 
-class Surface:
-
-    def __init__(self, name):
-        self.name = name
+    def __init__(self, filename):
+        self.filename = Path(filename)
         self.points = []
 
+    def read(self):
 
-    def add_point(
-        self,
-        x,
-        y,
-        z,
-        identifier
-    ):
-        self.points.append(
-            SurfacePoint(
-                float(x),
-                float(y),
-                float(z),
-                str(identifier)
-            )
-        )
+        with open(self.filename, "r") as f:
 
+            for line in f:
 
-    def xyz(self):
+                line = line.strip()
 
-        return np.array(
-            [
-                [
-                    p.x,
-                    p.y,
-                    p.z
-                ]
-                for p in self.points
-            ]
-        )
+                if not line:
+                    continue
 
+                if line.startswith("*"):
+                    continue
+
+                parts = line.split()
+
+                if len(parts) < 4:
+                    continue
+
+                self.points.append(
+                    MapPoint(
+                        float(parts[0]),
+                        float(parts[1]),
+                        float(parts[2]),
+                        parts[3]
+                    )
+                )
+
+        return self
 
 
-class TopSurface(Surface):
+class ThicknessMap:
 
-    def __init__(self):
-        super().__init__("TOP")
+    def __init__(self, filename):
+        self.filename = Path(filename)
+        self.points = []
 
+    def read(self):
 
+        with open(self.filename, "r") as f:
 
-class BottomSurface(Surface):
+            for line in f:
 
-    def __init__(self):
-        super().__init__("BOTTOM")
+                line=line.strip()
 
+                if not line:
+                    continue
 
+                parts=line.split()
 
-class ThicknessSurface(Surface):
+                if len(parts)<4:
+                    continue
 
-    def __init__(self):
-        super().__init__("THICKNESS")
+                self.points.append(
+                    MapPoint(
+                        float(parts[0]),
+                        float(parts[1]),
+                        float(parts[2]),
+                        parts[3]
+                    )
+                )
+
+        return self

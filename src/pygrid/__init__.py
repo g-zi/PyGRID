@@ -1,13 +1,12 @@
-from .maps import (
-    Surface,
-    TopSurface,
-    BottomSurface,
-    ThicknessSurface
-)
+"""
+PyGRID
+Eclipse GRDECL grid generator
+"""
 
-from .faults import Fault, FaultSet
+__version__ = "0.1.0"
 
 from .grid import GridModel
 
-
-__version__ = "0.1.0"
+__all__ = [
+    "GridModel",
+]
