@@ -25,10 +25,19 @@ class FaultTrace:
 
 
 class FaultSet:
-    """Collection of fault traces used as interpolation barriers."""
+    """Collection of TinyECL top/bottom fault traces.
 
-    def __init__(self, traces=None):
+    ``traces`` are the top traces from ``*.flt`` and are the authoritative
+    source for Eclipse FAULTS names and fault topology.
+
+    ``bottom_traces`` are the optional ``*.flb`` traces.  A fault is slanted
+    only when the same fault name occurs in both files.  Bottom traces never
+    rename top traces and never create synthetic names.
+    """
+
+    def __init__(self, traces=None, bottom_traces=None):
         self.traces = list(traces or [])
+        self.bottom_traces = list(bottom_traces or [])
 
     def __bool__(self):
         return bool(self.traces)
@@ -41,37 +50,95 @@ class FaultSet:
                 result.append((trace, np.asarray(p1, float), np.asarray(p2, float)))
         return result
 
+    @property
+    def names(self):
+        """Top-fault names in first-occurrence order."""
+        return _unique_names(self.traces)
+
+    @property
+    def bottom_names(self):
+        """Bottom-fault names in first-occurrence order."""
+        return _unique_names(self.bottom_traces)
+
+    @property
+    def slanted_names(self):
+        """Fault names present in both ``*.flt`` and ``*.flb``."""
+        bottom = set(self.bottom_names)
+        return [name for name in self.names if name in bottom]
+
     @classmethod
-    def from_tinyecl(cls, top_filename, names_filename=None):
+    def from_tinyecl(cls, top_filename, bottom_filename=None):
+        """Read TinyECL top and optional bottom fault polylines.
+
+        TinyECL stores the fault name in the final column of both ``*.flt``
+        and ``*.flb`` records.  The name in ``*.flt`` is authoritative.
+
+        Older PyGRID code matched contiguous top groups to bottom groups by
+        *order* and generated fallback names such as ``FAULT_4`` when the
+        counts differed.  That is wrong for TinyECL because:
+
+        * vertical faults may exist only in ``*.flt``;
+        * a fault name may occur in more than one non-contiguous polyline;
+        * ``*.flb`` contains only the faults that have a bottom trace.
+
+        We therefore preserve every source name exactly as written and pair
+        slanted geometry only by matching names.
         """
-        Read TinyECL fault polylines.
+        top_groups = _read_contiguous_groups(top_filename, id_column=-1)
+        traces = [
+            FaultTrace(
+                name=_clean_fault_name(source_id),
+                source_id=_clean_fault_name(source_id),
+                points=np.asarray(points, dtype=float),
+            )
+            for source_id, points in top_groups
+        ]
 
-        ``.flt`` files contain X Y and a polyline identifier.  The optional
-        ``.flb`` file contains the same traces with a final textual fault name.
-        The contiguous polyline groups in both files are matched by order.
-        """
-        top_groups = _read_contiguous_groups(top_filename, id_column=2)
-
-        names = []
-        if names_filename and Path(names_filename).exists():
-            name_groups = _read_contiguous_groups(names_filename, id_column=-1)
-            names = [group_id for group_id, _ in name_groups]
-
-        traces = []
-        for idx, (source_id, points) in enumerate(top_groups):
-            name = names[idx] if idx < len(names) else f"FAULT_{idx + 1}"
-            traces.append(
+        bottom_traces = []
+        if bottom_filename and Path(bottom_filename).exists():
+            bottom_groups = _read_contiguous_groups(bottom_filename, id_column=-1)
+            bottom_traces = [
                 FaultTrace(
-                    name=name,
-                    source_id=str(source_id),
+                    name=_clean_fault_name(source_id),
+                    source_id=_clean_fault_name(source_id),
                     points=np.asarray(points, dtype=float),
                 )
-            )
+                for source_id, points in bottom_groups
+            ]
 
-        return cls(traces)
+        return cls(traces=traces, bottom_traces=bottom_traces)
+
+    def named_traces(self, name, bottom=False):
+        """Return all top or bottom polyline groups with ``name``."""
+        source = self.bottom_traces if bottom else self.traces
+        return [trace for trace in source if trace.name == name]
+
+    def slant_displacement(self, name, point):
+        """Return local XY top-to-bottom displacement for a slanted fault.
+
+        The displacement is measured geometrically, not by record order:
+
+        1. find the nearest point on any top polyline with ``name``;
+        2. find the nearest point on any bottom polyline with the same name;
+        3. return ``bottom - top``.
+
+        Nearest-point matching is appropriate for TinyECL's sliding-fault
+        input because the bottom trace is normally a laterally displaced
+        version of the same fault.  It also works when one fault name occurs
+        in several non-contiguous top polyline groups.
+        """
+        point = np.asarray(point, dtype=float)
+        top = self.named_traces(name, bottom=False)
+        bottom = self.named_traces(name, bottom=True)
+        if not top or not bottom:
+            return np.zeros(2, dtype=float)
+
+        top_point = _nearest_point_on_traces(point, top)
+        bottom_point = _nearest_point_on_traces(top_point, bottom)
+        return bottom_point - top_point
 
     def blocks_segment(self, p1, p2):
-        """Return True if the open line p1-p2 crosses any fault segment."""
+        """Return True if the open line p1-p2 crosses any top fault segment."""
         return bool(self.blocked_mask(p1, np.atleast_2d(p2))[0])
 
     def blocked_mask(self, origin, targets):
@@ -104,6 +171,60 @@ class FaultSet:
         return blocked
 
 
+def _clean_fault_name(value):
+    """Normalize only surrounding whitespace/quotes; preserve the source name."""
+    return str(value).strip().strip("'\"")
+
+
+def _unique_names(traces):
+    seen = set()
+    result = []
+    for trace in traces:
+        if trace.name not in seen:
+            seen.add(trace.name)
+            result.append(trace.name)
+    return result
+
+
+def _nearest_point_on_segment(point, a, b):
+    point = np.asarray(point, dtype=float)
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    ab = b - a
+    denom = float(np.dot(ab, ab))
+    if denom <= _EPS:
+        return a.copy()
+    t = float(np.dot(point - a, ab) / denom)
+    t = min(1.0, max(0.0, t))
+    return a + t * ab
+
+
+def _nearest_point_on_traces(point, traces):
+    point = np.asarray(point, dtype=float)
+    best = None
+    best_d2 = np.inf
+
+    for trace in traces:
+        if len(trace.points) == 1:
+            candidate = np.asarray(trace.points[0], dtype=float)
+            d2 = float(np.sum((candidate - point) ** 2))
+            if d2 < best_d2:
+                best = candidate
+                best_d2 = d2
+            continue
+
+        for a, b in trace.segments:
+            candidate = _nearest_point_on_segment(point, a, b)
+            d2 = float(np.sum((candidate - point) ** 2))
+            if d2 < best_d2:
+                best = candidate
+                best_d2 = d2
+
+    if best is None:
+        return point.copy()
+    return np.asarray(best, dtype=float)
+
+
 def _read_contiguous_groups(filename, id_column):
     groups = []
     current_id = None
@@ -119,7 +240,7 @@ def _read_contiguous_groups(filename, id_column):
             if len(parts) < 3:
                 continue
 
-            ident = parts[id_column]
+            ident = _clean_fault_name(parts[id_column])
             point = (float(parts[0]), float(parts[1]))
 
             if current_id is None:

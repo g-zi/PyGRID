@@ -39,14 +39,219 @@ class GRDECLWriter:
             (self.model.ny + 1, self.model.nx + 1, 2)
         )
 
-    def write_coord(self, f):
-        pillars = self._pillars()
-        f.write("COORD\n")
-        for x, y in pillars:
-            f.write(
-                f"  {x:.6f} {y:.6f} {self.PILLAR_Z_TOP:.6f} "
-                f"{x:.6f} {y:.6f} {self.PILLAR_Z_BOTTOM:.6f}\n"
+    def _fault_pillar_names(self):
+        """Map grid-pillar indices to the source fault names touching them."""
+        result = {}
+        slanted = set(self.model.fault_set.slanted_names)
+        if not slanted:
+            return result
+
+        for name, i1, j1, face in self.fault_faces():
+            if name not in slanted:
+                continue
+
+            # fault_faces uses 1-based Eclipse cell indices.
+            if face == "X+":
+                # East edge of cell (i1,j1): pillar column i1.
+                endpoints = ((j1 - 1, i1), (j1, i1))
+            elif face == "Y+":
+                # South edge of cell (i1,j1): pillar row j1.
+                endpoints = ((j1, i1 - 1), (j1, i1))
+            else:
+                continue
+
+            for key in endpoints:
+                result.setdefault(key, set()).add(name)
+
+        return result
+
+    def _fault_reference_dz(self, name):
+        """Robust top-to-bottom structural depth separation for ``name``."""
+        if not hasattr(self, "_fault_reference_dz_cache"):
+            self._fault_reference_dz_cache = {}
+        if name in self._fault_reference_dz_cache:
+            return self._fault_reference_dz_cache[name]
+
+        top_map = getattr(self.model, "top_map", None)
+        bottom_map = getattr(self.model, "bottom_map", None)
+        if top_map is None or bottom_map is None:
+            self._fault_reference_dz_cache[name] = None
+            return None
+
+        values = []
+        for trace in self.model.fault_set.named_traces(name, bottom=False):
+            for point in trace.points:
+                point = np.asarray(point, dtype=float)
+                displacement = self.model.fault_set.slant_displacement(name, point)
+                bottom_xy = point + displacement
+                z_top = float(top_map.interpolate(point))
+                z_bottom = float(bottom_map.interpolate(bottom_xy))
+                dz = z_bottom - z_top
+                if np.isfinite(dz) and abs(dz) > 1.0e-6:
+                    values.append(dz)
+
+        if not values:
+            result = None
+        else:
+            result = float(np.median(np.asarray(values, dtype=float)))
+
+        self._fault_reference_dz_cache[name] = result
+        return result
+
+    def _fault_reference_depths(self, name, top_xy, bottom_xy):
+        """Return stable structural top/bottom depths for a slanted pillar.
+
+        Scattered-map interpolation can occasionally make the local TOP and
+        BOTTOM surfaces nearly coincide or reverse at a fault.  Such a tiny
+        denominator would create an unrealistically long COORD stick.  Use the
+        median separation measured along the named source traces as a robust
+        fallback for these local outliers.
+        """
+        top_map = getattr(self.model, "top_map", None)
+        bottom_map = getattr(self.model, "bottom_map", None)
+        thickness_map = getattr(self.model, "thickness_map", None)
+
+        if top_map is None:
+            return None
+
+        z_top = float(top_map.interpolate(np.asarray(top_xy, dtype=float)))
+
+        if bottom_map is not None:
+            z_bottom = float(
+                bottom_map.interpolate(np.asarray(bottom_xy, dtype=float))
             )
+            local_dz = z_bottom - z_top
+            reference_dz = self._fault_reference_dz(name)
+
+            if reference_dz is not None and abs(reference_dz) > 1.0e-6:
+                ratio = abs(local_dz) / abs(reference_dz)
+                if (
+                    local_dz * reference_dz <= 0.0
+                    or ratio < 0.25
+                    or ratio > 3.0
+                ):
+                    z_bottom = z_top + reference_dz
+
+        elif thickness_map is not None:
+            thickness = float(
+                thickness_map.interpolate(np.asarray(top_xy, dtype=float))
+            )
+            if abs(thickness) <= 1.0e-6:
+                return None
+            z_bottom = z_top + thickness
+
+        else:
+            return None
+
+        if abs(z_bottom - z_top) <= 1.0e-6:
+            return None
+        return z_top, z_bottom
+
+    def _coord_pillars(self):
+        """Return per-pillar COORD endpoints, including slanted fault sticks.
+
+        The normal grid remains unchanged.  Only pillars that form a fault face
+        whose name occurs in both ``*.flt`` and ``*.flb`` are inclined.
+
+        For such a pillar, the top staircase position is kept fixed and the
+        local FLT->FLB displacement is applied at the structural bottom depth.
+        Two nearby points on that same line are written to COORD, with a modest
+        depth margin so the generated cells lie safely inside the pillar span.
+        """
+        base = self._pillar_array()
+        ny, nx = self.model.ny, self.model.nx
+
+        coord_top = np.empty((ny + 1, nx + 1, 3), dtype=float)
+        coord_bottom = np.empty((ny + 1, nx + 1, 3), dtype=float)
+
+        coord_top[:, :, :2] = base
+        coord_top[:, :, 2] = self.PILLAR_Z_TOP
+        coord_bottom[:, :, :2] = base
+        coord_bottom[:, :, 2] = self.PILLAR_Z_BOTTOM
+
+        fault_pillars = self._fault_pillar_names()
+        if not fault_pillars:
+            return coord_top, coord_bottom
+
+        for (j, i), names in fault_pillars.items():
+            base_xy = base[j, i]
+            top_candidates = []
+            bottom_candidates = []
+
+            for name in sorted(names):
+                displacement = self.model.fault_set.slant_displacement(
+                    name, base_xy
+                )
+                if float(np.linalg.norm(displacement)) <= 1.0e-9:
+                    continue
+
+                desired_bottom_xy = base_xy + displacement
+                depths = self._fault_reference_depths(
+                    name, base_xy, desired_bottom_xy
+                )
+
+                if depths is None:
+                    # No structural depth information: retain the historical
+                    # Z endpoints but still encode the requested lateral tilt.
+                    top_candidates.append(
+                        np.asarray(
+                            [base_xy[0], base_xy[1], self.PILLAR_Z_TOP],
+                            dtype=float,
+                        )
+                    )
+                    bottom_candidates.append(
+                        np.asarray(
+                            [
+                                desired_bottom_xy[0],
+                                desired_bottom_xy[1],
+                                self.PILLAR_Z_BOTTOM,
+                            ],
+                            dtype=float,
+                        )
+                    )
+                    continue
+
+                z_fault_top, z_fault_bottom = depths
+                dz = z_fault_bottom - z_fault_top
+                slope = displacement / dz
+
+                # Define a short, well-conditioned pillar segment that brackets
+                # both interpreted fault traces.  COORD only needs two points
+                # on the straight pillar; they need not use global 0/100000 Z.
+                margin = max(25.0, 0.20 * abs(dz))
+                z1 = min(z_fault_top, z_fault_bottom) - margin
+                z2 = max(z_fault_top, z_fault_bottom) + margin
+
+                xy1 = base_xy + slope * (z1 - z_fault_top)
+                xy2 = base_xy + slope * (z2 - z_fault_top)
+
+                top_candidates.append(
+                    np.asarray([xy1[0], xy1[1], z1], dtype=float)
+                )
+                bottom_candidates.append(
+                    np.asarray([xy2[0], xy2[1], z2], dtype=float)
+                )
+
+            if top_candidates:
+                # At a rare intersection of two slanted faults, average the
+                # independently defined sticks rather than choosing one name.
+                coord_top[j, i] = np.mean(top_candidates, axis=0)
+                coord_bottom[j, i] = np.mean(bottom_candidates, axis=0)
+
+        return coord_top, coord_bottom
+
+    def write_coord(self, f):
+        coord_top, coord_bottom = self._coord_pillars()
+
+        f.write("COORD\n")
+        for j in range(self.model.ny + 1):
+            for i in range(self.model.nx + 1):
+                xt, yt, zt = coord_top[j, i]
+                xb, yb, zb = coord_bottom[j, i]
+                f.write(
+                    f"  {xt:.6f} {yt:.6f} {zt:.6f} "
+                    f"{xb:.6f} {yb:.6f} {zb:.6f}\n"
+                )
         f.write("/\n\n")
 
     def _layer_fractions(self):
