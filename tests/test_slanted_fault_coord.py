@@ -34,6 +34,7 @@ def test_same_name_bottom_trace_tilts_only_matching_fault_pillars(tmp_path):
     model.bottom_faults = str(tmp_path / "case.flb")
     model.layers = 2
     model.split_faults = True
+    model.slanted_fault_mode = "COORD"
     model.read_maps()
     model.read_faults()
 

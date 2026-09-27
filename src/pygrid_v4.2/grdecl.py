@@ -245,37 +245,14 @@ class GRDECLWriter:
                             found.add((trace.name, i + 1, j + 1, "Y+"))
         return sorted(found, key=lambda x: (x[0], x[2], x[1], x[3]))
 
-    def _raw_fault_faces(self):
-        """Discrete FLT staircase selected on the undeformed Cartesian grid."""
-        cached = getattr(self, "_raw_fault_faces_cache", None)
-        if cached is not None:
-            return cached
-        if not self.model.split_faults or not self.model.fault_set:
-            self._raw_fault_faces_cache = []
-            return []
-        base = self._base_pillar_array()
-        centres = self._cell_centres_from_pillars(base)
-        self._raw_fault_faces_cache = self._faces_for_fault_set_on_centres(
-            self._fault_set_for_level("top"), centres
-        )
-        return self._raw_fault_faces_cache
-
     @staticmethod
-    def _fault_edge_endpoints(i1, j1, face):
-        """Return zero-based pillar endpoints for one 1-based Eclipse face."""
-        if face == "X+":
-            return ((j1 - 1, i1), (j1, i1))
-        if face == "Y+":
-            return ((j1, i1 - 1), (j1, i1))
-        return ()
-
-    def _ordered_fault_pillar_components(self, name):
-        """Return ordered pillar chains for one raw stair-step fault name."""
+    def _ordered_pillar_components_from_faces(faces, name):
+        """Return ordered pillar chains for ``name`` from explicit face records."""
         adjacency = {}
-        for face_name, i1, j1, face in self._raw_fault_faces():
+        for face_name, i1, j1, face in faces:
             if face_name != name:
                 continue
-            endpoints = self._fault_edge_endpoints(i1, j1, face)
+            endpoints = GRDECLWriter._fault_edge_endpoints(i1, j1, face)
             if len(endpoints) != 2:
                 continue
             a, b = endpoints
@@ -296,7 +273,9 @@ class GRDECLWriter:
                 unseen.discard(node)
                 stack.extend(adjacency.get(node, ()))
 
-            ends = [node for node in comp if len(adjacency.get(node, ())) == 1]
+            ends = sorted(
+                node for node in comp if len(adjacency.get(node, ())) == 1
+            )
             start = ends[0] if ends else min(comp)
             ordered = [start]
             previous = None
@@ -308,8 +287,6 @@ class GRDECLWriter:
                 ]
                 if not candidates:
                     break
-                # A normal staircase is unbranched.  If an exact grid-corner
-                # crossing creates an ambiguity, prefer an unvisited neighbour.
                 unvisited = [node for node in candidates if node not in ordered]
                 if not unvisited:
                     break
@@ -320,6 +297,274 @@ class GRDECLWriter:
                     break
             components.append(ordered)
         return components
+
+    def _legacy_raw_fault_faces(self):
+        """Return the proven v3.22 centre-crossing logical fault path."""
+        base = self._base_pillar_array()
+        centres = self._cell_centres_from_pillars(base)
+        return self._faces_for_fault_set_on_centres(
+            self._fault_set_for_level("top"), centres
+        )
+
+    def _representative_xy_edge_spacing(self, base):
+        lengths = []
+        for j in range(self.model.ny + 1):
+            for i in range(self.model.nx):
+                lengths.append(float(np.linalg.norm(base[j, i + 1] - base[j, i])))
+        for j in range(self.model.ny):
+            for i in range(self.model.nx + 1):
+                lengths.append(float(np.linalg.norm(base[j + 1, i] - base[j, i])))
+        finite = np.asarray([v for v in lengths if np.isfinite(v) and v > 1.0e-12])
+        return float(np.median(finite)) if finite.size else 1.0
+
+    def _fault_path_edge_cost(
+        self, base, trace, u, v, step_index, step_count,
+        start_station, end_station, previous_axis=None,
+    ):
+        """V4 cost for one candidate logical fault edge.
+
+        The cost balances proximity to FLT, alignment with its local tangent,
+        along-trace station progress and excessive I/J switching.  All terms
+        are dimensionless so the same defaults work for metric and FIELD maps.
+        """
+        midpoint = 0.5 * (np.asarray(base[u], float) + np.asarray(base[v], float))
+        _hit, distance, station, tangent, _at_start, _at_end = (
+            _project_point_to_trace(midpoint, trace)
+        )
+        edge = np.asarray(base[v], float) - np.asarray(base[u], float)
+        edge_len = float(np.linalg.norm(edge))
+        tangent_len = float(np.linalg.norm(tangent))
+        if edge_len <= 1.0e-12 or tangent_len <= 1.0e-12:
+            return np.inf
+        edge /= edge_len
+        tangent = np.asarray(tangent, float) / tangent_len
+        spacing = self._representative_xy_edge_spacing(base)
+
+        distance_term = (float(distance) / max(spacing, 1.0e-12)) ** 2
+        alignment_term = 1.0 - abs(float(np.dot(edge, tangent)))
+        expected_station = float(start_station) + (
+            (float(step_index) + 0.5) / max(float(step_count), 1.0)
+        ) * (float(end_station) - float(start_station))
+        station_span = max(abs(float(end_station) - float(start_station)), 1.0e-9)
+        station_term = ((float(station) - expected_station) / station_span) ** 2
+
+        axis = "I" if u[0] == v[0] else "J"
+        turn_term = 1.0 if previous_axis is not None and axis != previous_axis else 0.0
+        return (
+            float(getattr(self.model, "fault_path_distance_weight", 1.0)) * distance_term
+            + float(getattr(self.model, "fault_path_alignment_weight", 1.0)) * alignment_term
+            + float(getattr(self.model, "fault_path_station_weight", 1.0)) * station_term
+            + float(getattr(self.model, "fault_path_turn_weight", 0.10)) * turn_term
+        )
+
+    def _fault_path_objective(self, base, trace, path):
+        if len(path) < 2:
+            return np.inf
+        _p0, _d0, s0, _t0, _a0, _b0 = _project_point_to_trace(base[path[0]], trace)
+        _p1, _d1, s1, _t1, _a1, _b1 = _project_point_to_trace(base[path[-1]], trace)
+        total = 0.0
+        previous_axis = None
+        step_count = len(path) - 1
+        for step, (u, v) in enumerate(zip(path[:-1], path[1:])):
+            total += self._fault_path_edge_cost(
+                base, trace, u, v, step, step_count, s0, s1, previous_axis
+            )
+            previous_axis = "I" if u[0] == v[0] else "J"
+        return float(total)
+
+    def _optimized_monotonic_fault_path(self, base, trace, legacy_chain):
+        """Return a lower-cost monotonic edge path with v3.22 endpoints.
+
+        Non-monotonic, branched or otherwise unusual legacy components are not
+        changed.  This is intentional: V4 is an experimental improvement path,
+        not a reason to weaken the robust v3.22 fallback.
+        """
+        if len(legacy_chain) < 2:
+            return list(legacy_chain), np.inf, np.inf
+        start = tuple(legacy_chain[0])
+        end = tuple(legacy_chain[-1])
+        dj_total = int(end[0] - start[0])
+        di_total = int(end[1] - start[1])
+        step_count = abs(dj_total) + abs(di_total)
+        if step_count != len(legacy_chain) - 1:
+            cost = self._fault_path_objective(base, trace, legacy_chain)
+            return list(legacy_chain), cost, cost
+
+        dj = 0 if dj_total == 0 else (1 if dj_total > 0 else -1)
+        di = 0 if di_total == 0 else (1 if di_total > 0 else -1)
+        _p0, _d0, s0, _t0, _a0, _b0 = _project_point_to_trace(base[start], trace)
+        _p1, _d1, s1, _t1, _a1, _b1 = _project_point_to_trace(base[end], trace)
+
+        states = {(start[0], start[1], None): (0.0, [start])}
+        nx, ny = self.model.nx, self.model.ny
+        for step in range(step_count):
+            next_states = {}
+            for (j, i, previous_axis), (cost, path) in states.items():
+                options = []
+                if j != end[0]:
+                    options.append(("J", (j + dj, i)))
+                if i != end[1]:
+                    options.append(("I", (j, i + di)))
+
+                for axis, v in options:
+                    jj, ii = v
+                    if not (0 <= jj <= ny and 0 <= ii <= nx):
+                        continue
+                    # A fault edge must separate two cells.  Walking *along*
+                    # the outside model boundary would create no Eclipse face.
+                    if axis == "J" and not (0 < i < nx):
+                        continue
+                    if axis == "I" and not (0 < j < ny):
+                        continue
+                    edge_cost = self._fault_path_edge_cost(
+                        base, trace, (j, i), v, step, step_count,
+                        s0, s1, previous_axis,
+                    )
+                    if not np.isfinite(edge_cost):
+                        continue
+                    key = (jj, ii, axis)
+                    candidate = (cost + edge_cost, path + [v])
+                    if key not in next_states or candidate[0] < next_states[key][0]:
+                        next_states[key] = candidate
+            states = next_states
+            if not states:
+                legacy_cost = self._fault_path_objective(base, trace, legacy_chain)
+                return list(legacy_chain), legacy_cost, legacy_cost
+
+        candidates = [
+            item for key, item in states.items() if key[:2] == end
+        ]
+        legacy_cost = self._fault_path_objective(base, trace, legacy_chain)
+        if not candidates:
+            return list(legacy_chain), legacy_cost, legacy_cost
+        candidate_cost, candidate_path = min(candidates, key=lambda item: item[0])
+        min_improvement = float(
+            getattr(self.model, "fault_path_min_improvement", 1.0e-9)
+        )
+        if candidate_cost < legacy_cost - min_improvement:
+            return candidate_path, legacy_cost, float(candidate_cost)
+        return list(legacy_chain), legacy_cost, legacy_cost
+
+    def _faces_from_fault_pillar_path(self, name, path):
+        faces = []
+        nx, ny = self.model.nx, self.model.ny
+        for (j0, i0), (j1, i1) in zip(path[:-1], path[1:]):
+            if i0 == i1 and abs(j1 - j0) == 1:
+                j = min(j0, j1)
+                i = i0
+                if 0 < i < nx:
+                    faces.append((name, i, j + 1, "X+"))
+            elif j0 == j1 and abs(i1 - i0) == 1:
+                j = j0
+                i = min(i0, i1)
+                if 0 < j < ny:
+                    faces.append((name, i + 1, j, "Y+"))
+            else:
+                return []
+        return faces
+
+    def _optimized_raw_fault_faces(self, legacy_faces):
+        base = self._base_pillar_array()
+        result = []
+        summary = {
+            "enabled": True,
+            "components": 0,
+            "changed_components": 0,
+            "legacy_faces": len(legacy_faces),
+            "optimized_faces": 0,
+            "legacy_cost": 0.0,
+            "optimized_cost": 0.0,
+            "fallback_components": 0,
+            "preserved_components": 0,
+        }
+        eligible_names = set(self._conforming_fault_names())
+        for name in self.model.fault_set.names:
+            components = self._ordered_pillar_components_from_faces(
+                legacy_faces, name
+            )
+            for chain in components:
+                summary["components"] += 1
+                if name not in eligible_names:
+                    result.extend(self._faces_from_fault_pillar_path(name, chain))
+                    summary["preserved_components"] += 1
+                    continue
+                trace = self._matched_top_trace_for_chain(name, chain, base)
+                if trace is None:
+                    result.extend(self._faces_from_fault_pillar_path(name, chain))
+                    summary["fallback_components"] += 1
+                    continue
+                path, before, after = self._optimized_monotonic_fault_path(
+                    base, trace, chain
+                )
+                faces = self._faces_from_fault_pillar_path(name, path)
+                if not faces:
+                    faces = self._faces_from_fault_pillar_path(name, chain)
+                    path = list(chain)
+                    after = before
+                    summary["fallback_components"] += 1
+                if path != list(chain):
+                    summary["changed_components"] += 1
+                summary["legacy_cost"] += float(before) if np.isfinite(before) else 0.0
+                summary["optimized_cost"] += float(after) if np.isfinite(after) else 0.0
+                result.extend(faces)
+
+        result = sorted(set(result), key=lambda x: (x[0], x[2], x[1], x[3]))
+        summary["optimized_faces"] = len(result)
+        self._fault_path_optimization_summary = summary
+        return result
+
+    def _raw_fault_faces(self):
+        """Discrete TOP fault path; V4 may optimize the v3.22 staircase.
+
+        V3.22's centre-crossing path is always calculated first and remains the
+        hard fallback.  V4 only changes a simple monotonic component when a
+        connected edge path with the same endpoints has a strictly lower FLT
+        proximity/alignment objective.
+        """
+        cached = getattr(self, "_raw_fault_faces_cache", None)
+        if cached is not None:
+            return cached
+        if not self.model.split_faults or not self.model.fault_set:
+            self._raw_fault_faces_cache = []
+            self._fault_path_optimization_summary = {"enabled": False}
+            return []
+
+        legacy = self._legacy_raw_fault_faces()
+        if bool(getattr(self.model, "fault_path_optimization", False)):
+            chosen = self._optimized_raw_fault_faces(legacy)
+            summary = getattr(self, "_fault_path_optimization_summary", {})
+            print(
+                "PyGRID V4: optimized fault-path search: "
+                f"{int(summary.get('components', 0))} component(s), "
+                f"{int(summary.get('changed_components', 0))} changed, "
+                f"{int(summary.get('fallback_components', 0))} fallback, "
+                f"{int(summary.get('preserved_components', 0))} preserved; "
+                f"faces {len(legacy)} -> {len(chosen)}."
+            )
+            self._raw_fault_faces_cache = chosen
+        else:
+            self._fault_path_optimization_summary = {
+                "enabled": False,
+                "legacy_faces": len(legacy),
+                "optimized_faces": len(legacy),
+            }
+            self._raw_fault_faces_cache = legacy
+        return self._raw_fault_faces_cache
+
+    @staticmethod
+    def _fault_edge_endpoints(i1, j1, face):
+        """Return zero-based pillar endpoints for one 1-based Eclipse face."""
+        if face == "X+":
+            return ((j1 - 1, i1), (j1, i1))
+        if face == "Y+":
+            return ((j1, i1 - 1), (j1, i1))
+        return ()
+
+    def _ordered_fault_pillar_components(self, name):
+        """Return ordered pillar chains for one selected logical fault name."""
+        return self._ordered_pillar_components_from_faces(
+            self._raw_fault_faces(), name
+        )
 
     def _matched_top_trace_for_chain(self, name, chain, base):
         """Return the TOP polyline belonging to one logical fault chain.
@@ -2109,6 +2354,9 @@ class GRDECLWriter:
         coord_top, coord_bottom = self._straighten_fault_plane_generators(
             coord_top, coord_bottom
         )
+        coord_top, coord_bottom = self._remesh_fault_normal_band(
+            coord_top, coord_bottom
+        )
         self._coord_pillars_cache = (coord_top.copy(), coord_bottom.copy())
         return coord_top, coord_bottom
 
@@ -3525,6 +3773,673 @@ class GRDECLWriter:
             f"median retained slant = {median_slant:.3f}."
         )
         return result_top, result_bottom
+
+    def _remesh_fault_normal_band(self, coord_top, coord_bottom):
+        """V4.2: rotate the inner structured grid band toward the FLT normal.
+
+        The complete accepted v3.22/V4 fault geometry is built first.  V4.2
+        then freezes every final fault-edge pillar and rotates neighbouring
+        logical cross-lines toward 90 degrees to the local FLT tangent while
+        preserving each pillar's current distance from the fault at the local
+        structural TOP depth.
+
+        Unlike V4.1 there is no harmonic smoothing iteration.  The first two
+        logical lines receive full angular control, farther lines taper back to
+        the existing grid, and a local Jacobian repair field reduces only those
+        individual pillar moves that threaten cell quality.  Safe parts of a
+        fault therefore keep a strong visible remesh instead of one difficult
+        cell scaling the complete fault back to an almost invisible move.
+
+        TOP and BOTTOM endpoints of every moved non-fault pillar receive the
+        same XY translation, so the accepted fault-pillar slant and FLT edge
+        remain unchanged.  Logical NX/NY topology and ZCORN are unchanged.
+        """
+        self._fault_normal_remesh_summary = {}
+        if not bool(getattr(self.model, "fault_normal_remesh", True)):
+            return coord_top, coord_bottom
+        if not (
+            bool(getattr(self.model, "conform_slanted_faults", False))
+            and self._slanted_fault_mode() in {"COORD", "MIXED"}
+            and self.model.split_faults
+            and self.model.fault_set
+            and self.model.fault_set.slanted_names
+        ):
+            return coord_top, coord_bottom
+
+        top_in = np.asarray(coord_top, dtype=float)
+        bottom_in = np.asarray(coord_bottom, dtype=float)
+        base = self._base_pillar_array()
+        anchors_by_name = self._fault_chain_anchors(base)
+        if not anchors_by_name:
+            return coord_top, coord_bottom
+
+        inner = max(1, int(getattr(
+            self.model, "fault_normal_remesh_inner_lines", 2
+        )))
+        outer = max(inner, int(getattr(
+            self.model, "fault_normal_remesh_outer_lines", 4
+        )))
+        max_rotation_deg = max(0.0, float(getattr(
+            self.model, "fault_normal_remesh_max_rotation_deg", 30.0
+        )))
+        if max_rotation_deg <= 1.0e-12:
+            return coord_top, coord_bottom
+
+        ny, nx = int(self.model.ny), int(self.model.nx)
+        axis_by_key = {}
+        for item in getattr(self, "_conforming_transverse_segments", ()):
+            key = tuple(item.get("key", ()))
+            axis = item.get("axis")
+            if len(key) == 2 and axis in {"I", "J"}:
+                axis_by_key[key] = axis
+
+        anchor_keys = set()
+        for anchors in anchors_by_name.values():
+            anchor_keys.update(anchors.keys())
+
+        interfaces = self._cell_corner_interfaces()
+        face_top_depths = {}
+        for face_name, i1, j1, face in self._raw_fault_faces():
+            i0 = i1 - 1
+            j0 = j1 - 1
+            if face == "X+":
+                endpoints = (((j0, i0 + 1), 1), ((j0 + 1, i0 + 1), 3))
+            elif face == "Y+":
+                endpoints = (((j0 + 1, i0), 2), ((j0 + 1, i0 + 1), 3))
+            else:
+                continue
+            for key, corner in endpoints:
+                face_top_depths.setdefault((face_name, key), []).append(
+                    float(interfaces[0, j0, i0, corner])
+                )
+
+        def unit(vector):
+            vector = np.asarray(vector, dtype=float)
+            length = float(np.linalg.norm(vector))
+            if length <= 1.0e-12:
+                return None
+            return vector / length
+
+        def rotate_toward(direction, target, maximum_degrees):
+            direction = unit(direction)
+            target = unit(target)
+            if direction is None or target is None:
+                return direction
+            dot = min(1.0, max(-1.0, float(np.dot(direction, target))))
+            angle = float(np.arccos(dot))
+            if angle <= 1.0e-12:
+                return direction
+            step = min(angle, np.deg2rad(maximum_degrees))
+            fraction = step / angle
+            sine = float(np.sin(angle))
+            if abs(sine) <= 1.0e-8:
+                return unit((1.0 - fraction) * direction + fraction * target)
+            return (
+                np.sin((1.0 - fraction) * angle) / sine * direction
+                + np.sin(fraction * angle) / sine * target
+            )
+
+        def local_axis(j, i, axis):
+            if axis == "I":
+                if i == 0:
+                    vector = base[j, 1] - base[j, 0]
+                elif i == nx:
+                    vector = base[j, nx] - base[j, nx - 1]
+                else:
+                    vector = base[j, i + 1] - base[j, i - 1]
+            else:
+                if j == 0:
+                    vector = base[1, i] - base[0, i]
+                elif j == ny:
+                    vector = base[ny, i] - base[ny - 1, i]
+                else:
+                    vector = base[j + 1, i] - base[j - 1, i]
+            return unit(vector)
+
+        delta_num = np.zeros((ny + 1, nx + 1, 2), dtype=float)
+        weight_sum = np.zeros((ny + 1, nx + 1), dtype=float)
+        proposal_count = 0
+        angle_before = []
+        angle_target = []
+
+        for name, anchors in anchors_by_name.items():
+            ordered = sorted(
+                anchors.items(), key=lambda item: float(item[1]["station"])
+            )
+            prepared = [
+                (key, data, unit(data.get("tangent", (0.0, 0.0))))
+                for key, data in ordered
+            ]
+
+            for index, ((j, i), data, tangent) in enumerate(prepared):
+                axis = axis_by_key.get((j, i))
+                if tangent is None or axis not in {"I", "J"}:
+                    continue
+
+                tangent_sum = 2.0 * tangent
+                tangent_weight = 2.0
+                for neighbour_index in (index - 1, index + 1):
+                    if not (0 <= neighbour_index < len(prepared)):
+                        continue
+                    neighbour = prepared[neighbour_index][2]
+                    if neighbour is None:
+                        continue
+                    if float(np.dot(neighbour, tangent)) < 0.0:
+                        neighbour = -neighbour
+                    tangent_sum += neighbour
+                    tangent_weight += 1.0
+                tangent = unit(tangent_sum / tangent_weight)
+                if tangent is None:
+                    continue
+                normal = unit(np.asarray([-tangent[1], tangent[0]], dtype=float))
+                forward = local_axis(j, i, axis)
+                if normal is None or forward is None:
+                    continue
+                if float(np.dot(normal, forward)) < 0.0:
+                    normal = -normal
+
+                depth_values = face_top_depths.get((name, (j, i)), ())
+                if depth_values:
+                    z_ref = float(np.median(np.asarray(depth_values, dtype=float)))
+                else:
+                    z_ref = 0.5 * (
+                        float(top_in[j, i, 2]) + float(bottom_in[j, i, 2])
+                    )
+                fault_xy = self._point_on_coord_pillar(
+                    top_in[j, i], bottom_in[j, i], z_ref
+                )[:2]
+
+                for offset in range(-outer, outer + 1):
+                    if offset == 0:
+                        continue
+                    if axis == "I":
+                        jj, ii = j, i + offset
+                    else:
+                        jj, ii = j + offset, i
+                    if not (0 <= jj <= ny and 0 <= ii <= nx):
+                        continue
+                    key = (jj, ii)
+                    if key in anchor_keys:
+                        continue
+                    if jj in (0, ny) or ii in (0, nx):
+                        continue
+
+                    current_xy = self._point_on_coord_pillar(
+                        top_in[jj, ii], bottom_in[jj, ii], z_ref
+                    )[:2]
+                    vector = current_xy - fault_xy
+                    radius = float(np.linalg.norm(vector))
+                    if radius <= 1.0e-9:
+                        continue
+                    target_direction = normal if offset > 0 else -normal
+                    current_direction = unit(vector)
+                    new_direction = rotate_toward(
+                        current_direction, target_direction, max_rotation_deg
+                    )
+                    if new_direction is None:
+                        continue
+                    desired_xy = fault_xy + radius * new_direction
+
+                    aoff = abs(offset)
+                    if aoff <= inner or outer == inner:
+                        weight = 1.0
+                    else:
+                        transition = (
+                            (aoff - inner) / float(outer + 1 - inner)
+                        )
+                        weight = self._smooth_taper(transition)
+                    if weight <= 1.0e-12:
+                        continue
+
+                    delta_num[jj, ii] += weight * (desired_xy - current_xy)
+                    weight_sum[jj, ii] += weight
+                    proposal_count += 1
+                    before_angle = np.degrees(np.arccos(min(
+                        1.0, max(-1.0, float(np.dot(
+                            current_direction, target_direction
+                        )))
+                    )))
+                    target_angle = np.degrees(np.arccos(min(
+                        1.0, max(-1.0, float(np.dot(
+                            unit(new_direction), target_direction
+                        )))
+                    )))
+                    angle_before.append(float(before_angle))
+                    angle_target.append(float(target_angle))
+
+        mask = weight_sum > 1.0e-12
+        if not np.any(mask):
+            return coord_top, coord_bottom
+
+        delta = np.zeros_like(delta_num)
+        delta[mask] = (
+            delta_num[mask] / weight_sum[mask, None]
+            * np.minimum(1.0, weight_sum[mask])[:, None]
+        )
+        for j, i in anchor_keys:
+            if 0 <= j <= ny and 0 <= i <= nx:
+                delta[j, i] = 0.0
+        delta[0, :] = 0.0
+        delta[ny, :] = 0.0
+        delta[:, 0] = 0.0
+        delta[:, nx] = 0.0
+
+        requested = np.linalg.norm(delta, axis=2)
+        movable = requested > 1.0e-9
+        if not np.any(movable):
+            return coord_top, coord_bottom
+
+        pinched = self._pinched_cell_mask(interfaces)
+        baseline_dets = self._cell_center_jacobians_from_coords(
+            top_in, bottom_in, interfaces
+        )
+        finite = baseline_dets[np.isfinite(baseline_dets) & ~pinched]
+        orientation = (
+            1.0 if len(finite) == 0 or float(np.median(finite)) >= 0.0 else -1.0
+        )
+        median_abs = max(
+            abs(float(np.median(finite))) if len(finite) else 1.0, 1.0e-30
+        )
+        signed = orientation * baseline_dets
+        active = signed[np.isfinite(signed) & ~pinched]
+        baseline_ratio = float(np.min(active)) / median_abs if len(active) else -np.inf
+        absolute_floor = max(0.0, float(getattr(
+            self.model, "fault_normal_remesh_min_jacobian_ratio", 0.02
+        )))
+        preserve = min(1.0, max(0.0, float(getattr(
+            self.model, "fault_normal_remesh_preserve_jacobian_fraction", 0.90
+        ))))
+        required_ratio = max(absolute_floor, preserve * baseline_ratio)
+
+        repair_factor = float(getattr(
+            self.model, "fault_normal_remesh_repair_factor", 0.65
+        ))
+        if not (0.0 < repair_factor < 1.0):
+            repair_factor = 0.65
+        repair_passes = max(1, int(getattr(
+            self.model, "fault_normal_remesh_repair_passes", 12
+        )))
+
+        scale = np.zeros((ny + 1, nx + 1), dtype=float)
+        scale[movable] = 1.0
+        result_top = top_in.copy()
+        result_bottom = bottom_in.copy()
+        final_ratio = baseline_ratio
+        repaired_cells = 0
+
+        for _pass in range(repair_passes + 1):
+            shift = scale[..., None] * delta
+            result_top = top_in.copy()
+            result_bottom = bottom_in.copy()
+            result_top[..., :2] += shift
+            result_bottom[..., :2] += shift
+
+            dets = self._cell_center_jacobians_from_coords(
+                result_top, result_bottom, interfaces
+            )
+            signed = orientation * dets
+            ratios = signed / median_abs
+            weak3d = (
+                ~np.isfinite(signed)
+                | ((ratios < required_ratio) & ~pinched)
+            )
+            weak2d = np.any(weak3d, axis=0)
+            if not np.any(weak2d):
+                vals = signed[np.isfinite(signed) & ~pinched]
+                final_ratio = (
+                    float(np.min(vals)) / median_abs if len(vals) else -np.inf
+                )
+                break
+
+            repaired_cells += int(np.count_nonzero(weak2d))
+            changed = False
+            for cj, ci in np.argwhere(weak2d):
+                for pj, pi in (
+                    (cj, ci), (cj, ci + 1),
+                    (cj + 1, ci), (cj + 1, ci + 1),
+                ):
+                    if movable[pj, pi] and scale[pj, pi] > 1.0e-5:
+                        scale[pj, pi] *= repair_factor
+                        changed = True
+            if not changed:
+                break
+        else:
+            pass
+
+        # Final hard check.  If the local repair could not preserve the floor,
+        # return the proven input geometry rather than exporting a weaker grid.
+        final_dets = self._cell_center_jacobians_from_coords(
+            result_top, result_bottom, interfaces
+        )
+        final_signed = orientation * final_dets
+        final_ratios = final_signed / median_abs
+        final_bad = int(np.count_nonzero(
+            ~np.isfinite(final_signed)
+            | ((final_ratios < required_ratio) & ~pinched)
+        ))
+        if final_bad:
+            self._fault_normal_remesh_summary = {
+                "enabled": True,
+                "accepted": False,
+                "reason": "jacobian_floor",
+                "weak_cells": final_bad,
+                "baseline_jacobian_ratio": float(baseline_ratio),
+                "required_jacobian_ratio": float(required_ratio),
+            }
+            print(
+                "PyGRID V4.2: fault-normal remesh rejected; "
+                f"{final_bad} cell(s) could not retain the Jacobian floor. "
+                "Keeping the proven pre-V4.2 geometry."
+            )
+            return coord_top, coord_bottom
+
+        actual_move = np.linalg.norm(scale[..., None] * delta, axis=2)
+        moved_values = actual_move[actual_move > 1.0e-9]
+        moved = int(len(moved_values))
+        full_strength = int(np.count_nonzero(scale[movable] >= 1.0 - 1.0e-12))
+        full_fraction = full_strength / max(int(np.count_nonzero(movable)), 1)
+        max_move = float(np.max(moved_values)) if moved else 0.0
+        median_move = float(np.median(moved_values)) if moved else 0.0
+        mean_scale = float(np.mean(scale[movable])) if np.any(movable) else 0.0
+
+        self._fault_normal_remesh_summary = {
+            "enabled": True,
+            "accepted": True,
+            "inner_lines": int(inner),
+            "outer_lines": int(outer),
+            "max_rotation_deg": float(max_rotation_deg),
+            "proposals": int(proposal_count),
+            "moved_pillars": moved,
+            "max_shift": float(max_move),
+            "median_shift": float(median_move),
+            "mean_local_scale": float(mean_scale),
+            "full_strength_fraction": float(full_fraction),
+            "repair_cell_visits": int(repaired_cells),
+            "baseline_jacobian_ratio": float(baseline_ratio),
+            "required_jacobian_ratio": float(required_ratio),
+            "min_jacobian_ratio": float(final_ratio),
+            "median_angle_before": (
+                float(np.median(angle_before)) if angle_before else 0.0
+            ),
+            "median_angle_target": (
+                float(np.median(angle_target)) if angle_target else 0.0
+            ),
+        }
+        print(
+            "PyGRID V4.2: fault-normal remesh: "
+            f"{moved} non-fault pillar(s) moved; "
+            f"inner/outer band = {inner}/{outer}; "
+            f"max local rotation = {max_rotation_deg:.1f} deg; "
+            f"{100.0 * full_fraction:.0f}% of affected pillars kept full strength; "
+            f"maximum/median XY move = {max_move:.2f}/{median_move:.2f}; "
+            f"minimum centre-Jacobian ratio = {final_ratio:.4f}."
+        )
+        return result_top, result_bottom
+
+    def _redistribute_fault_trace_band_harmonic(
+        self, seed_top, seed_bottom, final_top, final_bottom
+    ):
+        """V4.1: smooth only the *surrounding* accepted fault deformation.
+
+        The complete v3.22/V4.0 fault pipeline is run first, including FLT-trace
+        conforming and fault-plane-generator straightening.  Those final fault
+        pillars are then frozen.  V4.1 redistributes only the displacement of
+        nearby non-fault pillars by solving a local discrete harmonic field.
+
+        This ordering is deliberate: V4.1 can visibly improve the shape of the
+        cells around a fault but cannot move the already accepted fault edge,
+        change the logical FAULTS path, change NX/NY, or alter the model
+        footprint.  A 3-D Jacobian line search rejects any unsafe redistribution.
+        """
+        enabled = bool(getattr(self.model, "fault_band_relaxation", False))
+        self._fault_band_relaxation_summary = {
+            "enabled": enabled,
+            "accepted_fraction": 0.0,
+            "moved_pillars": 0,
+            "before_roughness": 0.0,
+            "after_roughness": 0.0,
+            "min_jacobian_ratio": 0.0,
+        }
+        if not enabled:
+            return final_top, final_bottom
+        if not (
+            bool(getattr(self.model, "conform_slanted_faults", False))
+            and self.model.split_faults
+            and self.model.fault_set
+        ):
+            return final_top, final_bottom
+
+        seed_top = np.asarray(seed_top, dtype=float)
+        seed_bottom = np.asarray(seed_bottom, dtype=float)
+        final_top = np.asarray(final_top, dtype=float)
+        final_bottom = np.asarray(final_bottom, dtype=float)
+        ny, nx = self.model.ny, self.model.nx
+
+        base = self._base_pillar_array()
+        anchors_by_name = self._fault_chain_anchors(
+            base, names=self._conforming_fault_names()
+        )
+        anchor_keys = {
+            tuple(key)
+            for anchors in anchors_by_name.values()
+            for key in anchors.keys()
+        }
+        if not anchor_keys:
+            return final_top, final_bottom
+
+        lines = max(1, int(getattr(
+            self.model, "fault_band_relax_lines", 6
+        )))
+        iterations = max(1, int(getattr(
+            self.model, "fault_band_relax_iterations", 80
+        )))
+        strength = min(1.0, max(0.0, float(getattr(
+            self.model, "fault_band_relax_strength", 0.85
+        ))))
+        blend = min(1.0, max(0.0, float(getattr(
+            self.model, "fault_band_relax_blend", 0.75
+        ))))
+
+        core = np.zeros((ny + 1, nx + 1), dtype=bool)
+        ring = np.zeros_like(core)
+        for j0, i0 in anchor_keys:
+            for radius, target_mask in ((lines, core), (lines + 1, ring)):
+                for dj in range(-radius, radius + 1):
+                    remain = radius - abs(dj)
+                    j = j0 + dj
+                    if not (0 <= j <= ny):
+                        continue
+                    ilo = max(0, i0 - remain)
+                    ihi = min(nx, i0 + remain)
+                    target_mask[j, ilo:ihi + 1] = True
+
+        anchor_mask = np.zeros_like(core)
+        for j, i in anchor_keys:
+            if 0 <= j <= ny and 0 <= i <= nx:
+                anchor_mask[j, i] = True
+        outer = np.zeros_like(core)
+        outer[0, :] = True
+        outer[ny, :] = True
+        outer[:, 0] = True
+        outer[:, nx] = True
+        movable = core & ~anchor_mask & ~outer
+        if not np.any(movable):
+            return final_top, final_bottom
+
+        seed_disp_top = final_top[..., :2] - seed_top[..., :2]
+        seed_disp_bottom = final_bottom[..., :2] - seed_bottom[..., :2]
+
+        def solve(seed_disp):
+            # Start from the already accepted displacement field.  Exact fault
+            # pillars, the one-cell outer ring of the local band, and the model
+            # boundary are Dirichlet controls.  Only the interior non-fault
+            # pillars are allowed to relax.
+            field = seed_disp.copy()
+            ring_boundary = ring & ~core
+            fixed = anchor_mask | ring_boundary | outer | ~ring
+            active = core & ~fixed
+            for _ in range(iterations):
+                old = field.copy()
+                total = np.zeros_like(field)
+                count = np.zeros((ny + 1, nx + 1), dtype=float)
+                total[1:, :] += old[:-1, :]
+                count[1:, :] += 1.0
+                total[:-1, :] += old[1:, :]
+                count[:-1, :] += 1.0
+                total[:, 1:] += old[:, :-1]
+                count[:, 1:] += 1.0
+                total[:, :-1] += old[:, 1:]
+                count[:, :-1] += 1.0
+                harmonic = total / np.maximum(count[..., None], 1.0)
+                field[active] = (
+                    (1.0 - strength) * old[active]
+                    + strength * harmonic[active]
+                )
+                # Reimpose the fixed accepted geometry exactly.
+                field[fixed] = seed_disp[fixed]
+
+            target = seed_disp.copy()
+            target[movable] = (
+                (1.0 - blend) * seed_disp[movable]
+                + blend * field[movable]
+            )
+            target[anchor_mask] = seed_disp[anchor_mask]
+            target[outer & ~anchor_mask] = seed_disp[outer & ~anchor_mask]
+            return target
+
+        target_disp_top = solve(seed_disp_top)
+        target_disp_bottom = solve(seed_disp_bottom)
+
+        def roughness(top_disp, bottom_disp):
+            value = 0.0
+            count = 0
+            for disp in (top_disp, bottom_disp):
+                di = disp[:, 1:] - disp[:, :-1]
+                dj = disp[1:, :] - disp[:-1, :]
+                mask_i = core[:, 1:] | core[:, :-1]
+                mask_j = core[1:, :] | core[:-1, :]
+                if np.any(mask_i):
+                    value += float(np.sum(di[mask_i] ** 2))
+                    count += int(np.count_nonzero(mask_i))
+                if np.any(mask_j):
+                    value += float(np.sum(dj[mask_j] ** 2))
+                    count += int(np.count_nonzero(mask_j))
+            return value / max(count, 1)
+
+        before_rough = roughness(seed_disp_top, seed_disp_bottom)
+        target_rough = roughness(target_disp_top, target_disp_bottom)
+        if not np.isfinite(target_rough) or target_rough >= before_rough - 1.0e-12:
+            self._fault_band_relaxation_summary.update({
+                "before_roughness": float(before_rough),
+                "after_roughness": float(before_rough),
+            })
+            return final_top, final_bottom
+
+        interfaces = self._cell_corner_interfaces()
+        pinched = self._pinched_cell_mask(interfaces)
+        base_dets = self._cell_center_jacobians_from_coords(
+            final_top, final_bottom, interfaces
+        )
+        finite = base_dets[np.isfinite(base_dets) & ~pinched]
+        orientation = (
+            1.0 if len(finite) == 0 or float(np.median(finite)) >= 0.0 else -1.0
+        )
+        median_abs = max(
+            abs(float(np.median(finite))) if len(finite) else 1.0, 1.0e-30
+        )
+        signed = orientation * base_dets
+        active = signed[np.isfinite(signed) & ~pinched]
+        base_ratio = float(np.min(active)) / median_abs if len(active) else -np.inf
+        absolute_floor = max(0.0, float(getattr(
+            self.model, "fault_trace_conform_min_jacobian_ratio", 0.02
+        )))
+        required_ratio = max(absolute_floor, 0.95 * base_ratio)
+
+        def quality(alpha):
+            alpha = min(1.0, max(0.0, float(alpha)))
+            top = final_top.copy()
+            bottom = final_bottom.copy()
+            top[..., :2] = (
+                final_top[..., :2]
+                + alpha * (
+                    (seed_top[..., :2] + target_disp_top)
+                    - final_top[..., :2]
+                )
+            )
+            bottom[..., :2] = (
+                final_bottom[..., :2]
+                + alpha * (
+                    (seed_bottom[..., :2] + target_disp_bottom)
+                    - final_bottom[..., :2]
+                )
+            )
+            # The final v3.22/V4.0 fault edge is immutable.
+            top[anchor_mask] = final_top[anchor_mask]
+            bottom[anchor_mask] = final_bottom[anchor_mask]
+            top[outer & ~anchor_mask] = final_top[outer & ~anchor_mask]
+            bottom[outer & ~anchor_mask] = final_bottom[outer & ~anchor_mask]
+
+            dets = self._cell_center_jacobians_from_coords(top, bottom, interfaces)
+            sgn = orientation * dets
+            bad = int(np.count_nonzero(
+                ~np.isfinite(sgn) | ((sgn <= 0.0) & ~pinched)
+            ))
+            vals = sgn[np.isfinite(sgn) & ~pinched]
+            ratio = float(np.min(vals)) / median_abs if len(vals) else -np.inf
+            return top, bottom, bad, ratio
+
+        cand_top, cand_bottom, bad, ratio = quality(1.0)
+        alpha = 1.0
+        if bad or ratio < required_ratio:
+            low, high = 0.0, 1.0
+            base_top, base_bottom, _bad0, ratio0 = quality(0.0)
+            best = (base_top, base_bottom, 0.0, ratio0)
+            steps = max(8, int(getattr(
+                self.model, "fault_trace_conform_line_search_steps", 14
+            )))
+            for _ in range(steps):
+                mid = 0.5 * (low + high)
+                t, b, bd, r = quality(mid)
+                if bd == 0 and r >= required_ratio:
+                    best = (t, b, mid, r)
+                    low = mid
+                else:
+                    high = mid
+            cand_top, cand_bottom, alpha, ratio = best
+
+        if alpha <= 1.0e-6:
+            self._fault_band_relaxation_summary.update({
+                "before_roughness": float(before_rough),
+                "after_roughness": float(before_rough),
+                "min_jacobian_ratio": float(base_ratio),
+                "lines": int(lines),
+            })
+            return final_top, final_bottom
+
+        final_disp_top = cand_top[..., :2] - seed_top[..., :2]
+        final_disp_bottom = cand_bottom[..., :2] - seed_bottom[..., :2]
+        after_rough = roughness(final_disp_top, final_disp_bottom)
+        move = np.maximum(
+            np.linalg.norm(cand_top[..., :2] - final_top[..., :2], axis=2),
+            np.linalg.norm(cand_bottom[..., :2] - final_bottom[..., :2], axis=2),
+        )
+        moved = int(np.count_nonzero(move > 1.0e-9))
+        self._fault_band_relaxation_summary.update({
+            "accepted_fraction": float(alpha),
+            "moved_pillars": moved,
+            "before_roughness": float(before_rough),
+            "after_roughness": float(after_rough),
+            "min_jacobian_ratio": float(ratio),
+            "lines": int(lines),
+        })
+        print(
+            "PyGRID V4.1: harmonic fault-band redistribution: "
+            f"{moved} non-fault pillar(s) adjusted; "
+            f"accepted fraction = {alpha:.3f}; "
+            f"band roughness {before_rough:.3g} -> {after_rough:.3g}; "
+            f"minimum centre-Jacobian ratio = {ratio:.4f}."
+        )
+        return cand_top, cand_bottom
 
     def _straighten_fault_plane_generators(self, coord_top, coord_bottom):
         """Regularise the final fault-edge COORD sticks along the ruled plane.
@@ -5075,6 +5990,172 @@ class GRDECLWriter:
         print(message + ".")
 
 
+    def _fault_face_graph_stats(self, faces):
+        """Return connected-component and branch statistics for fault edges."""
+        adjacency = {}
+        for record in faces:
+            if len(record) == 4:
+                _name, i1, j1, face = record
+            else:
+                i1, j1, face = record[-3:]
+            endpoints = self._fault_edge_endpoints(int(i1), int(j1), face)
+            if len(endpoints) != 2:
+                continue
+            a, b = endpoints
+            adjacency.setdefault(a, set()).add(b)
+            adjacency.setdefault(b, set()).add(a)
+        unseen = set(adjacency)
+        components = 0
+        while unseen:
+            components += 1
+            stack = [next(iter(unseen))]
+            while stack:
+                node = stack.pop()
+                if node not in unseen:
+                    continue
+                unseen.remove(node)
+                stack.extend(adjacency.get(node, ()))
+        branch_nodes = sum(1 for neighbours in adjacency.values() if len(neighbours) > 2)
+        end_nodes = sum(1 for neighbours in adjacency.values() if len(neighbours) == 1)
+        return {
+            "components": int(components),
+            "branch_nodes": int(branch_nodes),
+            "end_nodes": int(end_nodes),
+            "vertices": int(len(adjacency)),
+        }
+
+    def _fault_block_count(self, faces):
+        """Count connected I/J cell regions after removing selected fault faces."""
+        nx, ny = self.model.nx, self.model.ny
+        barriers = {(int(i1), int(j1), str(face)) for _n, i1, j1, face in faces}
+        seen = set()
+        blocks = 0
+        for j in range(ny):
+            for i in range(nx):
+                seed = (j, i)
+                if seed in seen:
+                    continue
+                blocks += 1
+                stack = [seed]
+                seen.add(seed)
+                while stack:
+                    cj, ci = stack.pop()
+                    neighbours = []
+                    if ci + 1 < nx and (ci + 1, cj + 1, "X+") not in barriers:
+                        neighbours.append((cj, ci + 1))
+                    if ci - 1 >= 0 and (ci, cj + 1, "X+") not in barriers:
+                        neighbours.append((cj, ci - 1))
+                    if cj + 1 < ny and (ci + 1, cj + 1, "Y+") not in barriers:
+                        neighbours.append((cj + 1, ci))
+                    if cj - 1 >= 0 and (ci + 1, cj, "Y+") not in barriers:
+                        neighbours.append((cj - 1, ci))
+                    for node in neighbours:
+                        if node not in seen:
+                            seen.add(node)
+                            stack.append(node)
+        return int(blocks)
+
+    def _geometric_fault_faces_from_interfaces(self, interfaces=None):
+        """Reconstruct internal ZCORN discontinuity faces from final geometry.
+
+        This mirrors the useful PyGRDECL idea of detecting faults from an
+        already-built corner-point grid rather than trusting the input fault
+        definition.  Names cannot be reconstructed from geometry alone, so the
+        returned records are ``(I, J, FACE)`` logical locations.
+        """
+        if interfaces is None:
+            interfaces = self._cell_corner_interfaces()
+        z = np.asarray(interfaces, dtype=float)
+        tol = max(
+            0.0,
+            float(getattr(self.model, "fault_topology_qc_depth_tolerance", 1.0e-6)),
+        )
+        nx, ny = self.model.nx, self.model.ny
+        detected = set()
+
+        for j in range(ny):
+            for i in range(nx - 1):
+                left = z[:, j, i, :]
+                right = z[:, j, i + 1, :]
+                diff = np.concatenate((
+                    np.abs(left[:, 1] - right[:, 0]),
+                    np.abs(left[:, 3] - right[:, 2]),
+                ))
+                finite = diff[np.isfinite(diff)]
+                if finite.size and float(np.max(finite)) > tol:
+                    detected.add((i + 1, j + 1, "X+"))
+
+        for j in range(ny - 1):
+            for i in range(nx):
+                upper = z[:, j, i, :]
+                lower = z[:, j + 1, i, :]
+                diff = np.concatenate((
+                    np.abs(upper[:, 2] - lower[:, 0]),
+                    np.abs(upper[:, 3] - lower[:, 1]),
+                ))
+                finite = diff[np.isfinite(diff)]
+                if finite.size and float(np.max(finite)) > tol:
+                    detected.add((i + 1, j + 1, "Y+"))
+
+        return sorted(detected, key=lambda x: (x[1], x[0], x[2]))
+
+    def _fault_topology_qc_summary(self):
+        """Independent V4 fault topology / fault-block QC summary."""
+        if (
+            not bool(getattr(self.model, "fault_topology_qc", True))
+            or not self.model.split_faults
+            or not self.model.fault_set
+        ):
+            return {"enabled": False}
+        intended = list(self._raw_fault_faces())
+        intended_locations = {(int(i), int(j), face) for _n, i, j, face in intended}
+        geometric = self._geometric_fault_faces_from_interfaces()
+        geometric_locations = set(geometric)
+        matched = intended_locations & geometric_locations
+        missing = intended_locations - geometric_locations
+        unexpected = geometric_locations - intended_locations
+
+        barrier_names = set()
+        if self.model.fault_set:
+            for name in self.model.fault_set.names:
+                named = self.model.fault_set.named_traces(name, bottom=False)
+                if named and all(bool(getattr(t, "surface_barrier", True)) for t in named):
+                    barrier_names.add(name)
+        expected_barrier_locations = {
+            (int(i), int(j), face)
+            for name, i, j, face in intended
+            if name in barrier_names
+        }
+        missing_barrier = expected_barrier_locations - geometric_locations
+
+        intended_stats = self._fault_face_graph_stats(intended)
+        geometric_named = [("GEOMETRY", i, j, face) for i, j, face in geometric]
+        geometric_stats = self._fault_face_graph_stats(geometric_named)
+        summary = {
+            "enabled": True,
+            "intended_faces": len(intended_locations),
+            "geometric_faces": len(geometric_locations),
+            "matched_faces": len(matched),
+            "missing_faces": len(missing),
+            "missing_barrier_faces": len(missing_barrier),
+            "unexpected_faces": len(unexpected),
+            "intended_components": intended_stats["components"],
+            "intended_branch_nodes": intended_stats["branch_nodes"],
+            "geometric_components": geometric_stats["components"],
+            "geometric_branch_nodes": geometric_stats["branch_nodes"],
+            "fault_blocks": self._fault_block_count(intended),
+            "missing_locations": sorted(missing),
+            "unexpected_locations": sorted(unexpected),
+        }
+        summary["status"] = (
+            "PASS" if summary["unexpected_faces"] == 0
+            and summary["missing_barrier_faces"] == 0
+            and summary["intended_branch_nodes"] == 0
+            else "CHECK"
+        )
+        self._fault_topology_summary = summary
+        return summary
+
     def _write_grid_qc_report(self, grdecl_filename):
         if not bool(getattr(self.model, "write_grid_qc_report", True)):
             return None
@@ -5261,6 +6342,160 @@ class GRDECLWriter:
                         )
             else:
                 f.write("No local COORD outliers required correction.\n")
+
+            f.write("\nV4 FAULT PATH OPTIMIZATION\n")
+            f.write("--------------------------\n")
+            path_summary = dict(getattr(
+                self, "_fault_path_optimization_summary", {}
+            ))
+            if path_summary.get("enabled"):
+                f.write(
+                    f"Legacy v3.22 faces          : "
+                    f"{int(path_summary.get('legacy_faces', 0))}\n"
+                )
+                f.write(
+                    f"Selected v4 faces           : "
+                    f"{int(path_summary.get('optimized_faces', 0))}\n"
+                )
+                f.write(
+                    f"Fault components searched   : "
+                    f"{int(path_summary.get('components', 0))}\n"
+                )
+                f.write(
+                    f"Components with changed path: "
+                    f"{int(path_summary.get('changed_components', 0))}\n"
+                )
+                f.write(
+                    f"Components using fallback   : "
+                    f"{int(path_summary.get('fallback_components', 0))}\n"
+                )
+                f.write(
+                    f"Non-conforming components kept v3.22: "
+                    f"{int(path_summary.get('preserved_components', 0))}\n"
+                )
+                f.write(
+                    f"Path objective              : "
+                    f"{float(path_summary.get('legacy_cost', 0.0)):.6f} -> "
+                    f"{float(path_summary.get('optimized_cost', 0.0)):.6f}\n"
+                )
+                f.write(
+                    "Safety rule                 : same endpoints; monotonic connected "
+                    "edge path only; v3.22 fallback otherwise\n"
+                )
+            else:
+                f.write("V4 fault-path optimization is disabled.\n")
+
+            f.write("\nV4.2 FAULT-NORMAL REMESH\n")
+            f.write("-------------------------\n")
+            remesh = dict(getattr(
+                self, "_fault_normal_remesh_summary", {}
+            ))
+            if remesh.get("enabled"):
+                f.write(
+                    f"Status                       : "
+                    f"{'ACCEPTED' if remesh.get('accepted', False) else 'REJECTED'}\n"
+                )
+                if remesh.get("accepted"):
+                    f.write(
+                        f"Logical inner/outer band     : "
+                        f"{int(remesh.get('inner_lines', 0))} / "
+                        f"{int(remesh.get('outer_lines', 0))} pillar lines\n"
+                    )
+                    f.write(
+                        f"Maximum requested rotation   : "
+                        f"{float(remesh.get('max_rotation_deg', 0.0)):.1f} degrees\n"
+                    )
+                    f.write(
+                        f"Non-fault pillars adjusted   : "
+                        f"{int(remesh.get('moved_pillars', 0))}\n"
+                    )
+                    f.write(
+                        f"Full-strength affected pillars: "
+                        f"{100.0 * float(remesh.get('full_strength_fraction', 0.0)):.1f}%\n"
+                    )
+                    f.write(
+                        f"Maximum / median XY move     : "
+                        f"{float(remesh.get('max_shift', 0.0)):.3f} / "
+                        f"{float(remesh.get('median_shift', 0.0)):.3f}\n"
+                    )
+                    f.write(
+                        f"Median cross-line error to normal: "
+                        f"{float(remesh.get('median_angle_before', 0.0)):.2f} -> "
+                        f"{float(remesh.get('median_angle_target', 0.0)):.2f} degrees "
+                        f"(before local Jacobian repair)\n"
+                    )
+                    f.write(
+                        f"Minimum centre-Jacobian ratio: "
+                        f"{float(remesh.get('min_jacobian_ratio', 0.0)):.4f} "
+                        f"(required {float(remesh.get('required_jacobian_ratio', 0.0)):.4f})\n"
+                    )
+                    f.write(
+                        "Safety rule                  : fault anchors and outer boundary frozen; "
+                        "only locally unsafe pillar moves are reduced\n"
+                    )
+                else:
+                    f.write(
+                        f"Reason                       : "
+                        f"{remesh.get('reason', 'quality guard')}\n"
+                    )
+            else:
+                f.write("V4.2 fault-normal remesh is disabled.\n")
+
+            f.write("\nV4 FAULT TOPOLOGY RECONSTRUCTION\n")
+            f.write("--------------------------------\n")
+            topology = self._fault_topology_qc_summary()
+            if topology.get("enabled"):
+                f.write(f"Status                       : {topology.get('status', 'CHECK')}\n")
+                f.write(
+                    f"Intended logical faces       : "
+                    f"{int(topology.get('intended_faces', 0))}\n"
+                )
+                f.write(
+                    f"Reconstructed ZCORN faces    : "
+                    f"{int(topology.get('geometric_faces', 0))}\n"
+                )
+                f.write(
+                    f"Matching faces               : "
+                    f"{int(topology.get('matched_faces', 0))}\n"
+                )
+                f.write(
+                    f"Missing intended faces       : "
+                    f"{int(topology.get('missing_faces', 0))}\n"
+                )
+                f.write(
+                    f"Missing barrier faces        : "
+                    f"{int(topology.get('missing_barrier_faces', 0))}\n"
+                )
+                f.write(
+                    f"Unexpected geometric faces   : "
+                    f"{int(topology.get('unexpected_faces', 0))}\n"
+                )
+                f.write(
+                    f"Intended components/branches : "
+                    f"{int(topology.get('intended_components', 0))} / "
+                    f"{int(topology.get('intended_branch_nodes', 0))}\n"
+                )
+                f.write(
+                    f"Geometry components/branches : "
+                    f"{int(topology.get('geometric_components', 0))} / "
+                    f"{int(topology.get('geometric_branch_nodes', 0))}\n"
+                )
+                f.write(
+                    f"Connected I/J fault blocks   : "
+                    f"{int(topology.get('fault_blocks', 0))}\n"
+                )
+                missing = list(topology.get("missing_locations", ()))
+                unexpected = list(topology.get("unexpected_locations", ()))
+                if missing:
+                    f.write("Missing face locations       : " + ", ".join(
+                        f"I={i},J={j},{face}" for i, j, face in missing[:20]
+                    ) + (" ..." if len(missing) > 20 else "") + "\n")
+                if unexpected:
+                    f.write("Unexpected face locations    : " + ", ".join(
+                        f"I={i},J={j},{face}" for i, j, face in unexpected[:20]
+                    ) + (" ..." if len(unexpected) > 20 else "") + "\n")
+            else:
+                f.write("V4 fault-topology reconstruction is disabled.\n")
 
             f.write("\nFLT TRACE CONFORMING\n")
             f.write("--------------------\n")

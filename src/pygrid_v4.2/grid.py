@@ -169,6 +169,45 @@ class GridModel:
         # FLT->FLB slant would fall below this fraction.
         self.fault_trace_conform_min_median_slant_fraction = 0.75
         self.fault_trace_conform_line_search_steps = 14
+
+        # V4 experimental branch: optimize the connected logical fault-edge
+        # path while preserving the proven v3.22 endpoints and retaining the
+        # v3.22 centre-crossing topology as a hard fallback.  The optimizer
+        # searches only monotonic I/J paths for a legacy monotonic component,
+        # so it cannot invent loops or change NX/NY.
+        self.fault_path_optimization = True
+        self.fault_path_distance_weight = 1.0
+        self.fault_path_alignment_weight = 1.0
+        self.fault_path_turn_weight = 0.10
+        self.fault_path_station_weight = 1.0
+        self.fault_path_min_improvement = 1.0e-9
+
+        # PyGRDECL-inspired independent topology QC.  After the final ZCORN is
+        # built, reconstruct all internal depth-discontinuity faces and compare
+        # them with the intended logical FAULTS path.  Also flood-fill the I/J
+        # cell graph to count fault-bounded connected blocks.
+        self.fault_topology_qc = True
+        self.fault_topology_qc_depth_tolerance = 1.0e-6
+
+        # V4.2 experimental geometry.  The complete proven v3.22/V4 fault
+        # construction runs first.  Then, with every final fault-edge pillar
+        # frozen, PyGRID explicitly rebuilds the neighbouring logical cross-lines
+        # as offset curves normal to FLT.  The first two lines receive full
+        # geometric control; farther lines blend back to the accepted grid.
+        # This is a real remeshing pass rather than the V4.1 harmonic smoother.
+        self.fault_normal_remesh = True
+        self.fault_normal_remesh_inner_lines = 2
+        self.fault_normal_remesh_outer_lines = 4
+        self.fault_normal_remesh_min_jacobian_ratio = 0.02
+        self.fault_normal_remesh_preserve_jacobian_fraction = 0.90
+        self.fault_normal_remesh_max_rotation_deg = 30.0
+        self.fault_normal_remesh_repair_factor = 0.65
+        self.fault_normal_remesh_repair_passes = 12
+
+        # V4.1 harmonic redistribution is retained only as an off-by-default
+        # comparison switch.  V4.2 never calls it in the normal pipeline.
+        self.fault_band_relaxation = False
+
         # V3.21 retained-slant regularisation is kept as an optional backwards
         # comparison only; V3.22 does not use it by default.
         self.fault_plane_straightening = False

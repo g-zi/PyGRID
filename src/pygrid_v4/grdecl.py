@@ -245,37 +245,14 @@ class GRDECLWriter:
                             found.add((trace.name, i + 1, j + 1, "Y+"))
         return sorted(found, key=lambda x: (x[0], x[2], x[1], x[3]))
 
-    def _raw_fault_faces(self):
-        """Discrete FLT staircase selected on the undeformed Cartesian grid."""
-        cached = getattr(self, "_raw_fault_faces_cache", None)
-        if cached is not None:
-            return cached
-        if not self.model.split_faults or not self.model.fault_set:
-            self._raw_fault_faces_cache = []
-            return []
-        base = self._base_pillar_array()
-        centres = self._cell_centres_from_pillars(base)
-        self._raw_fault_faces_cache = self._faces_for_fault_set_on_centres(
-            self._fault_set_for_level("top"), centres
-        )
-        return self._raw_fault_faces_cache
-
     @staticmethod
-    def _fault_edge_endpoints(i1, j1, face):
-        """Return zero-based pillar endpoints for one 1-based Eclipse face."""
-        if face == "X+":
-            return ((j1 - 1, i1), (j1, i1))
-        if face == "Y+":
-            return ((j1, i1 - 1), (j1, i1))
-        return ()
-
-    def _ordered_fault_pillar_components(self, name):
-        """Return ordered pillar chains for one raw stair-step fault name."""
+    def _ordered_pillar_components_from_faces(faces, name):
+        """Return ordered pillar chains for ``name`` from explicit face records."""
         adjacency = {}
-        for face_name, i1, j1, face in self._raw_fault_faces():
+        for face_name, i1, j1, face in faces:
             if face_name != name:
                 continue
-            endpoints = self._fault_edge_endpoints(i1, j1, face)
+            endpoints = GRDECLWriter._fault_edge_endpoints(i1, j1, face)
             if len(endpoints) != 2:
                 continue
             a, b = endpoints
@@ -296,7 +273,9 @@ class GRDECLWriter:
                 unseen.discard(node)
                 stack.extend(adjacency.get(node, ()))
 
-            ends = [node for node in comp if len(adjacency.get(node, ())) == 1]
+            ends = sorted(
+                node for node in comp if len(adjacency.get(node, ())) == 1
+            )
             start = ends[0] if ends else min(comp)
             ordered = [start]
             previous = None
@@ -308,8 +287,6 @@ class GRDECLWriter:
                 ]
                 if not candidates:
                     break
-                # A normal staircase is unbranched.  If an exact grid-corner
-                # crossing creates an ambiguity, prefer an unvisited neighbour.
                 unvisited = [node for node in candidates if node not in ordered]
                 if not unvisited:
                     break
@@ -320,6 +297,274 @@ class GRDECLWriter:
                     break
             components.append(ordered)
         return components
+
+    def _legacy_raw_fault_faces(self):
+        """Return the proven v3.22 centre-crossing logical fault path."""
+        base = self._base_pillar_array()
+        centres = self._cell_centres_from_pillars(base)
+        return self._faces_for_fault_set_on_centres(
+            self._fault_set_for_level("top"), centres
+        )
+
+    def _representative_xy_edge_spacing(self, base):
+        lengths = []
+        for j in range(self.model.ny + 1):
+            for i in range(self.model.nx):
+                lengths.append(float(np.linalg.norm(base[j, i + 1] - base[j, i])))
+        for j in range(self.model.ny):
+            for i in range(self.model.nx + 1):
+                lengths.append(float(np.linalg.norm(base[j + 1, i] - base[j, i])))
+        finite = np.asarray([v for v in lengths if np.isfinite(v) and v > 1.0e-12])
+        return float(np.median(finite)) if finite.size else 1.0
+
+    def _fault_path_edge_cost(
+        self, base, trace, u, v, step_index, step_count,
+        start_station, end_station, previous_axis=None,
+    ):
+        """V4 cost for one candidate logical fault edge.
+
+        The cost balances proximity to FLT, alignment with its local tangent,
+        along-trace station progress and excessive I/J switching.  All terms
+        are dimensionless so the same defaults work for metric and FIELD maps.
+        """
+        midpoint = 0.5 * (np.asarray(base[u], float) + np.asarray(base[v], float))
+        _hit, distance, station, tangent, _at_start, _at_end = (
+            _project_point_to_trace(midpoint, trace)
+        )
+        edge = np.asarray(base[v], float) - np.asarray(base[u], float)
+        edge_len = float(np.linalg.norm(edge))
+        tangent_len = float(np.linalg.norm(tangent))
+        if edge_len <= 1.0e-12 or tangent_len <= 1.0e-12:
+            return np.inf
+        edge /= edge_len
+        tangent = np.asarray(tangent, float) / tangent_len
+        spacing = self._representative_xy_edge_spacing(base)
+
+        distance_term = (float(distance) / max(spacing, 1.0e-12)) ** 2
+        alignment_term = 1.0 - abs(float(np.dot(edge, tangent)))
+        expected_station = float(start_station) + (
+            (float(step_index) + 0.5) / max(float(step_count), 1.0)
+        ) * (float(end_station) - float(start_station))
+        station_span = max(abs(float(end_station) - float(start_station)), 1.0e-9)
+        station_term = ((float(station) - expected_station) / station_span) ** 2
+
+        axis = "I" if u[0] == v[0] else "J"
+        turn_term = 1.0 if previous_axis is not None and axis != previous_axis else 0.0
+        return (
+            float(getattr(self.model, "fault_path_distance_weight", 1.0)) * distance_term
+            + float(getattr(self.model, "fault_path_alignment_weight", 1.0)) * alignment_term
+            + float(getattr(self.model, "fault_path_station_weight", 1.0)) * station_term
+            + float(getattr(self.model, "fault_path_turn_weight", 0.10)) * turn_term
+        )
+
+    def _fault_path_objective(self, base, trace, path):
+        if len(path) < 2:
+            return np.inf
+        _p0, _d0, s0, _t0, _a0, _b0 = _project_point_to_trace(base[path[0]], trace)
+        _p1, _d1, s1, _t1, _a1, _b1 = _project_point_to_trace(base[path[-1]], trace)
+        total = 0.0
+        previous_axis = None
+        step_count = len(path) - 1
+        for step, (u, v) in enumerate(zip(path[:-1], path[1:])):
+            total += self._fault_path_edge_cost(
+                base, trace, u, v, step, step_count, s0, s1, previous_axis
+            )
+            previous_axis = "I" if u[0] == v[0] else "J"
+        return float(total)
+
+    def _optimized_monotonic_fault_path(self, base, trace, legacy_chain):
+        """Return a lower-cost monotonic edge path with v3.22 endpoints.
+
+        Non-monotonic, branched or otherwise unusual legacy components are not
+        changed.  This is intentional: V4 is an experimental improvement path,
+        not a reason to weaken the robust v3.22 fallback.
+        """
+        if len(legacy_chain) < 2:
+            return list(legacy_chain), np.inf, np.inf
+        start = tuple(legacy_chain[0])
+        end = tuple(legacy_chain[-1])
+        dj_total = int(end[0] - start[0])
+        di_total = int(end[1] - start[1])
+        step_count = abs(dj_total) + abs(di_total)
+        if step_count != len(legacy_chain) - 1:
+            cost = self._fault_path_objective(base, trace, legacy_chain)
+            return list(legacy_chain), cost, cost
+
+        dj = 0 if dj_total == 0 else (1 if dj_total > 0 else -1)
+        di = 0 if di_total == 0 else (1 if di_total > 0 else -1)
+        _p0, _d0, s0, _t0, _a0, _b0 = _project_point_to_trace(base[start], trace)
+        _p1, _d1, s1, _t1, _a1, _b1 = _project_point_to_trace(base[end], trace)
+
+        states = {(start[0], start[1], None): (0.0, [start])}
+        nx, ny = self.model.nx, self.model.ny
+        for step in range(step_count):
+            next_states = {}
+            for (j, i, previous_axis), (cost, path) in states.items():
+                options = []
+                if j != end[0]:
+                    options.append(("J", (j + dj, i)))
+                if i != end[1]:
+                    options.append(("I", (j, i + di)))
+
+                for axis, v in options:
+                    jj, ii = v
+                    if not (0 <= jj <= ny and 0 <= ii <= nx):
+                        continue
+                    # A fault edge must separate two cells.  Walking *along*
+                    # the outside model boundary would create no Eclipse face.
+                    if axis == "J" and not (0 < i < nx):
+                        continue
+                    if axis == "I" and not (0 < j < ny):
+                        continue
+                    edge_cost = self._fault_path_edge_cost(
+                        base, trace, (j, i), v, step, step_count,
+                        s0, s1, previous_axis,
+                    )
+                    if not np.isfinite(edge_cost):
+                        continue
+                    key = (jj, ii, axis)
+                    candidate = (cost + edge_cost, path + [v])
+                    if key not in next_states or candidate[0] < next_states[key][0]:
+                        next_states[key] = candidate
+            states = next_states
+            if not states:
+                legacy_cost = self._fault_path_objective(base, trace, legacy_chain)
+                return list(legacy_chain), legacy_cost, legacy_cost
+
+        candidates = [
+            item for key, item in states.items() if key[:2] == end
+        ]
+        legacy_cost = self._fault_path_objective(base, trace, legacy_chain)
+        if not candidates:
+            return list(legacy_chain), legacy_cost, legacy_cost
+        candidate_cost, candidate_path = min(candidates, key=lambda item: item[0])
+        min_improvement = float(
+            getattr(self.model, "fault_path_min_improvement", 1.0e-9)
+        )
+        if candidate_cost < legacy_cost - min_improvement:
+            return candidate_path, legacy_cost, float(candidate_cost)
+        return list(legacy_chain), legacy_cost, legacy_cost
+
+    def _faces_from_fault_pillar_path(self, name, path):
+        faces = []
+        nx, ny = self.model.nx, self.model.ny
+        for (j0, i0), (j1, i1) in zip(path[:-1], path[1:]):
+            if i0 == i1 and abs(j1 - j0) == 1:
+                j = min(j0, j1)
+                i = i0
+                if 0 < i < nx:
+                    faces.append((name, i, j + 1, "X+"))
+            elif j0 == j1 and abs(i1 - i0) == 1:
+                j = j0
+                i = min(i0, i1)
+                if 0 < j < ny:
+                    faces.append((name, i + 1, j, "Y+"))
+            else:
+                return []
+        return faces
+
+    def _optimized_raw_fault_faces(self, legacy_faces):
+        base = self._base_pillar_array()
+        result = []
+        summary = {
+            "enabled": True,
+            "components": 0,
+            "changed_components": 0,
+            "legacy_faces": len(legacy_faces),
+            "optimized_faces": 0,
+            "legacy_cost": 0.0,
+            "optimized_cost": 0.0,
+            "fallback_components": 0,
+            "preserved_components": 0,
+        }
+        eligible_names = set(self._conforming_fault_names())
+        for name in self.model.fault_set.names:
+            components = self._ordered_pillar_components_from_faces(
+                legacy_faces, name
+            )
+            for chain in components:
+                summary["components"] += 1
+                if name not in eligible_names:
+                    result.extend(self._faces_from_fault_pillar_path(name, chain))
+                    summary["preserved_components"] += 1
+                    continue
+                trace = self._matched_top_trace_for_chain(name, chain, base)
+                if trace is None:
+                    result.extend(self._faces_from_fault_pillar_path(name, chain))
+                    summary["fallback_components"] += 1
+                    continue
+                path, before, after = self._optimized_monotonic_fault_path(
+                    base, trace, chain
+                )
+                faces = self._faces_from_fault_pillar_path(name, path)
+                if not faces:
+                    faces = self._faces_from_fault_pillar_path(name, chain)
+                    path = list(chain)
+                    after = before
+                    summary["fallback_components"] += 1
+                if path != list(chain):
+                    summary["changed_components"] += 1
+                summary["legacy_cost"] += float(before) if np.isfinite(before) else 0.0
+                summary["optimized_cost"] += float(after) if np.isfinite(after) else 0.0
+                result.extend(faces)
+
+        result = sorted(set(result), key=lambda x: (x[0], x[2], x[1], x[3]))
+        summary["optimized_faces"] = len(result)
+        self._fault_path_optimization_summary = summary
+        return result
+
+    def _raw_fault_faces(self):
+        """Discrete TOP fault path; V4 may optimize the v3.22 staircase.
+
+        V3.22's centre-crossing path is always calculated first and remains the
+        hard fallback.  V4 only changes a simple monotonic component when a
+        connected edge path with the same endpoints has a strictly lower FLT
+        proximity/alignment objective.
+        """
+        cached = getattr(self, "_raw_fault_faces_cache", None)
+        if cached is not None:
+            return cached
+        if not self.model.split_faults or not self.model.fault_set:
+            self._raw_fault_faces_cache = []
+            self._fault_path_optimization_summary = {"enabled": False}
+            return []
+
+        legacy = self._legacy_raw_fault_faces()
+        if bool(getattr(self.model, "fault_path_optimization", False)):
+            chosen = self._optimized_raw_fault_faces(legacy)
+            summary = getattr(self, "_fault_path_optimization_summary", {})
+            print(
+                "PyGRID V4: optimized fault-path search: "
+                f"{int(summary.get('components', 0))} component(s), "
+                f"{int(summary.get('changed_components', 0))} changed, "
+                f"{int(summary.get('fallback_components', 0))} fallback, "
+                f"{int(summary.get('preserved_components', 0))} preserved; "
+                f"faces {len(legacy)} -> {len(chosen)}."
+            )
+            self._raw_fault_faces_cache = chosen
+        else:
+            self._fault_path_optimization_summary = {
+                "enabled": False,
+                "legacy_faces": len(legacy),
+                "optimized_faces": len(legacy),
+            }
+            self._raw_fault_faces_cache = legacy
+        return self._raw_fault_faces_cache
+
+    @staticmethod
+    def _fault_edge_endpoints(i1, j1, face):
+        """Return zero-based pillar endpoints for one 1-based Eclipse face."""
+        if face == "X+":
+            return ((j1 - 1, i1), (j1, i1))
+        if face == "Y+":
+            return ((j1, i1 - 1), (j1, i1))
+        return ()
+
+    def _ordered_fault_pillar_components(self, name):
+        """Return ordered pillar chains for one selected logical fault name."""
+        return self._ordered_pillar_components_from_faces(
+            self._raw_fault_faces(), name
+        )
 
     def _matched_top_trace_for_chain(self, name, chain, base):
         """Return the TOP polyline belonging to one logical fault chain.
@@ -5075,6 +5320,172 @@ class GRDECLWriter:
         print(message + ".")
 
 
+    def _fault_face_graph_stats(self, faces):
+        """Return connected-component and branch statistics for fault edges."""
+        adjacency = {}
+        for record in faces:
+            if len(record) == 4:
+                _name, i1, j1, face = record
+            else:
+                i1, j1, face = record[-3:]
+            endpoints = self._fault_edge_endpoints(int(i1), int(j1), face)
+            if len(endpoints) != 2:
+                continue
+            a, b = endpoints
+            adjacency.setdefault(a, set()).add(b)
+            adjacency.setdefault(b, set()).add(a)
+        unseen = set(adjacency)
+        components = 0
+        while unseen:
+            components += 1
+            stack = [next(iter(unseen))]
+            while stack:
+                node = stack.pop()
+                if node not in unseen:
+                    continue
+                unseen.remove(node)
+                stack.extend(adjacency.get(node, ()))
+        branch_nodes = sum(1 for neighbours in adjacency.values() if len(neighbours) > 2)
+        end_nodes = sum(1 for neighbours in adjacency.values() if len(neighbours) == 1)
+        return {
+            "components": int(components),
+            "branch_nodes": int(branch_nodes),
+            "end_nodes": int(end_nodes),
+            "vertices": int(len(adjacency)),
+        }
+
+    def _fault_block_count(self, faces):
+        """Count connected I/J cell regions after removing selected fault faces."""
+        nx, ny = self.model.nx, self.model.ny
+        barriers = {(int(i1), int(j1), str(face)) for _n, i1, j1, face in faces}
+        seen = set()
+        blocks = 0
+        for j in range(ny):
+            for i in range(nx):
+                seed = (j, i)
+                if seed in seen:
+                    continue
+                blocks += 1
+                stack = [seed]
+                seen.add(seed)
+                while stack:
+                    cj, ci = stack.pop()
+                    neighbours = []
+                    if ci + 1 < nx and (ci + 1, cj + 1, "X+") not in barriers:
+                        neighbours.append((cj, ci + 1))
+                    if ci - 1 >= 0 and (ci, cj + 1, "X+") not in barriers:
+                        neighbours.append((cj, ci - 1))
+                    if cj + 1 < ny and (ci + 1, cj + 1, "Y+") not in barriers:
+                        neighbours.append((cj + 1, ci))
+                    if cj - 1 >= 0 and (ci + 1, cj, "Y+") not in barriers:
+                        neighbours.append((cj - 1, ci))
+                    for node in neighbours:
+                        if node not in seen:
+                            seen.add(node)
+                            stack.append(node)
+        return int(blocks)
+
+    def _geometric_fault_faces_from_interfaces(self, interfaces=None):
+        """Reconstruct internal ZCORN discontinuity faces from final geometry.
+
+        This mirrors the useful PyGRDECL idea of detecting faults from an
+        already-built corner-point grid rather than trusting the input fault
+        definition.  Names cannot be reconstructed from geometry alone, so the
+        returned records are ``(I, J, FACE)`` logical locations.
+        """
+        if interfaces is None:
+            interfaces = self._cell_corner_interfaces()
+        z = np.asarray(interfaces, dtype=float)
+        tol = max(
+            0.0,
+            float(getattr(self.model, "fault_topology_qc_depth_tolerance", 1.0e-6)),
+        )
+        nx, ny = self.model.nx, self.model.ny
+        detected = set()
+
+        for j in range(ny):
+            for i in range(nx - 1):
+                left = z[:, j, i, :]
+                right = z[:, j, i + 1, :]
+                diff = np.concatenate((
+                    np.abs(left[:, 1] - right[:, 0]),
+                    np.abs(left[:, 3] - right[:, 2]),
+                ))
+                finite = diff[np.isfinite(diff)]
+                if finite.size and float(np.max(finite)) > tol:
+                    detected.add((i + 1, j + 1, "X+"))
+
+        for j in range(ny - 1):
+            for i in range(nx):
+                upper = z[:, j, i, :]
+                lower = z[:, j + 1, i, :]
+                diff = np.concatenate((
+                    np.abs(upper[:, 2] - lower[:, 0]),
+                    np.abs(upper[:, 3] - lower[:, 1]),
+                ))
+                finite = diff[np.isfinite(diff)]
+                if finite.size and float(np.max(finite)) > tol:
+                    detected.add((i + 1, j + 1, "Y+"))
+
+        return sorted(detected, key=lambda x: (x[1], x[0], x[2]))
+
+    def _fault_topology_qc_summary(self):
+        """Independent V4 fault topology / fault-block QC summary."""
+        if (
+            not bool(getattr(self.model, "fault_topology_qc", True))
+            or not self.model.split_faults
+            or not self.model.fault_set
+        ):
+            return {"enabled": False}
+        intended = list(self._raw_fault_faces())
+        intended_locations = {(int(i), int(j), face) for _n, i, j, face in intended}
+        geometric = self._geometric_fault_faces_from_interfaces()
+        geometric_locations = set(geometric)
+        matched = intended_locations & geometric_locations
+        missing = intended_locations - geometric_locations
+        unexpected = geometric_locations - intended_locations
+
+        barrier_names = set()
+        if self.model.fault_set:
+            for name in self.model.fault_set.names:
+                named = self.model.fault_set.named_traces(name, bottom=False)
+                if named and all(bool(getattr(t, "surface_barrier", True)) for t in named):
+                    barrier_names.add(name)
+        expected_barrier_locations = {
+            (int(i), int(j), face)
+            for name, i, j, face in intended
+            if name in barrier_names
+        }
+        missing_barrier = expected_barrier_locations - geometric_locations
+
+        intended_stats = self._fault_face_graph_stats(intended)
+        geometric_named = [("GEOMETRY", i, j, face) for i, j, face in geometric]
+        geometric_stats = self._fault_face_graph_stats(geometric_named)
+        summary = {
+            "enabled": True,
+            "intended_faces": len(intended_locations),
+            "geometric_faces": len(geometric_locations),
+            "matched_faces": len(matched),
+            "missing_faces": len(missing),
+            "missing_barrier_faces": len(missing_barrier),
+            "unexpected_faces": len(unexpected),
+            "intended_components": intended_stats["components"],
+            "intended_branch_nodes": intended_stats["branch_nodes"],
+            "geometric_components": geometric_stats["components"],
+            "geometric_branch_nodes": geometric_stats["branch_nodes"],
+            "fault_blocks": self._fault_block_count(intended),
+            "missing_locations": sorted(missing),
+            "unexpected_locations": sorted(unexpected),
+        }
+        summary["status"] = (
+            "PASS" if summary["unexpected_faces"] == 0
+            and summary["missing_barrier_faces"] == 0
+            and summary["intended_branch_nodes"] == 0
+            else "CHECK"
+        )
+        self._fault_topology_summary = summary
+        return summary
+
     def _write_grid_qc_report(self, grdecl_filename):
         if not bool(getattr(self.model, "write_grid_qc_report", True)):
             return None
@@ -5261,6 +5672,104 @@ class GRDECLWriter:
                         )
             else:
                 f.write("No local COORD outliers required correction.\n")
+
+            f.write("\nV4 FAULT PATH OPTIMIZATION\n")
+            f.write("--------------------------\n")
+            path_summary = dict(getattr(
+                self, "_fault_path_optimization_summary", {}
+            ))
+            if path_summary.get("enabled"):
+                f.write(
+                    f"Legacy v3.22 faces          : "
+                    f"{int(path_summary.get('legacy_faces', 0))}\n"
+                )
+                f.write(
+                    f"Selected v4 faces           : "
+                    f"{int(path_summary.get('optimized_faces', 0))}\n"
+                )
+                f.write(
+                    f"Fault components searched   : "
+                    f"{int(path_summary.get('components', 0))}\n"
+                )
+                f.write(
+                    f"Components with changed path: "
+                    f"{int(path_summary.get('changed_components', 0))}\n"
+                )
+                f.write(
+                    f"Components using fallback   : "
+                    f"{int(path_summary.get('fallback_components', 0))}\n"
+                )
+                f.write(
+                    f"Non-conforming components kept v3.22: "
+                    f"{int(path_summary.get('preserved_components', 0))}\n"
+                )
+                f.write(
+                    f"Path objective              : "
+                    f"{float(path_summary.get('legacy_cost', 0.0)):.6f} -> "
+                    f"{float(path_summary.get('optimized_cost', 0.0)):.6f}\n"
+                )
+                f.write(
+                    "Safety rule                 : same endpoints; monotonic connected "
+                    "edge path only; v3.22 fallback otherwise\n"
+                )
+            else:
+                f.write("V4 fault-path optimization is disabled.\n")
+
+            f.write("\nV4 FAULT TOPOLOGY RECONSTRUCTION\n")
+            f.write("--------------------------------\n")
+            topology = self._fault_topology_qc_summary()
+            if topology.get("enabled"):
+                f.write(f"Status                       : {topology.get('status', 'CHECK')}\n")
+                f.write(
+                    f"Intended logical faces       : "
+                    f"{int(topology.get('intended_faces', 0))}\n"
+                )
+                f.write(
+                    f"Reconstructed ZCORN faces    : "
+                    f"{int(topology.get('geometric_faces', 0))}\n"
+                )
+                f.write(
+                    f"Matching faces               : "
+                    f"{int(topology.get('matched_faces', 0))}\n"
+                )
+                f.write(
+                    f"Missing intended faces       : "
+                    f"{int(topology.get('missing_faces', 0))}\n"
+                )
+                f.write(
+                    f"Missing barrier faces        : "
+                    f"{int(topology.get('missing_barrier_faces', 0))}\n"
+                )
+                f.write(
+                    f"Unexpected geometric faces   : "
+                    f"{int(topology.get('unexpected_faces', 0))}\n"
+                )
+                f.write(
+                    f"Intended components/branches : "
+                    f"{int(topology.get('intended_components', 0))} / "
+                    f"{int(topology.get('intended_branch_nodes', 0))}\n"
+                )
+                f.write(
+                    f"Geometry components/branches : "
+                    f"{int(topology.get('geometric_components', 0))} / "
+                    f"{int(topology.get('geometric_branch_nodes', 0))}\n"
+                )
+                f.write(
+                    f"Connected I/J fault blocks   : "
+                    f"{int(topology.get('fault_blocks', 0))}\n"
+                )
+                missing = list(topology.get("missing_locations", ()))
+                unexpected = list(topology.get("unexpected_locations", ()))
+                if missing:
+                    f.write("Missing face locations       : " + ", ".join(
+                        f"I={i},J={j},{face}" for i, j, face in missing[:20]
+                    ) + (" ..." if len(missing) > 20 else "") + "\n")
+                if unexpected:
+                    f.write("Unexpected face locations    : " + ", ".join(
+                        f"I={i},J={j},{face}" for i, j, face in unexpected[:20]
+                    ) + (" ..." if len(unexpected) > 20 else "") + "\n")
+            else:
+                f.write("V4 fault-topology reconstruction is disabled.\n")
 
             f.write("\nFLT TRACE CONFORMING\n")
             f.write("--------------------\n")
